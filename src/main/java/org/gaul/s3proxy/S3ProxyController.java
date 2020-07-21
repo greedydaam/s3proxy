@@ -17,7 +17,6 @@
 package org.gaul.s3proxy;
 
 import com.google.common.collect.ImmutableMap;
-import org.jclouds.blobstore.BlobStore;
 import org.jclouds.blobstore.ContainerNotFoundException;
 import org.jclouds.blobstore.KeyNotFoundException;
 import org.jclouds.http.HttpResponse;
@@ -29,7 +28,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Controller;
 
-import javax.annotation.Nullable;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import java.io.IOException;
@@ -46,18 +44,6 @@ public class S3ProxyController {
 
     @Autowired
     private S3ProxyHandler handler;
-
-
-    public void postInit(final BlobStore blobStore,
-                      AuthenticationType authenticationType, final String identity,
-                      final String credential, @Nullable String virtualHost,
-                      long v4MaxNonChunkedRequestSize, boolean ignoreUnknownHeaders,
-                      CrossOriginResourceSharing corsRules, String servicePath,
-                      int maximumTimeSkew) {
-        handler = new S3ProxyHandler(blobStore, authenticationType, identity,
-                credential, virtualHost, v4MaxNonChunkedRequestSize,
-                ignoreUnknownHeaders, corsRules, servicePath, maximumTimeSkew);
-    }
 
     private void sendS3Exception(HttpServletRequest request,
                                  HttpServletResponse response, S3Exception se)
