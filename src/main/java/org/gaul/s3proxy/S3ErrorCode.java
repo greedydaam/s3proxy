@@ -26,7 +26,7 @@ import com.google.common.base.CaseFormat;
  * List of S3 error codes.  Reference:
  * http://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html
  */
-enum S3ErrorCode {
+public enum S3ErrorCode {
     ACCESS_DENIED(HttpServletResponse.SC_FORBIDDEN, "Forbidden"),
     BAD_DIGEST(HttpServletResponse.SC_BAD_REQUEST, "Bad Request"),
     BUCKET_ALREADY_EXISTS(HttpServletResponse.SC_FORBIDDEN,
