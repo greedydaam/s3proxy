@@ -18,35 +18,112 @@ package org.gaul.s3proxy;
 
 import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.common.io.Files;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import com.google.inject.Module;
+import org.jclouds.Constants;
+import org.jclouds.ContextBuilder;
+import org.jclouds.JcloudsVersion;
 import org.jclouds.blobstore.BlobStore;
+import org.jclouds.blobstore.BlobStoreContext;
+import org.jclouds.concurrent.DynamicExecutors;
+import org.jclouds.concurrent.config.ExecutorServiceModule;
+import org.jclouds.location.reference.LocationConstants;
+import org.jclouds.logging.slf4j.config.SLF4JLoggingModule;
+import org.jclouds.openstack.swift.v1.blobstore.RegionScopedBlobStoreContext;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
+import org.springframework.boot.origin.OriginTrackedValue;
 import org.springframework.boot.web.servlet.ServletRegistrationBean;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.env.AbstractEnvironment;
 import org.springframework.core.env.Environment;
+import org.springframework.core.env.MapPropertySource;
+import org.springframework.core.env.PropertySource;
 
+import java.io.File;
+import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Jetty-specific handler for S3 requests.
  */
+@Configuration
 @ConditionalOnWebApplication
-@ConditionalOnProperty(name = "s3proxy.servlet.enabled", havingValue = "true", matchIfMissing = true)
+@ConditionalOnProperty(name = S3ProxyConstants.PROPERTY_SERVLET_ENABLED, havingValue = "true", matchIfMissing = true)
 public class S3ProxyConfig {
 
     @Bean
-    public ServletRegistrationBean s3ProxyHandler(Environment properties) throws URISyntaxException {
-        ServletRegistrationBean registrationBean = new ServletRegistrationBean();
-        Builder builder = Builder.fromProperties(properties);
+    public ServletRegistrationBean s3ProxyHandler(Environment env) throws Exception {
+        Builder builder = Builder.fromProperties(env);
 
-        S3ProxyHandler handler = new S3ProxyHandler(builder.blobStore,
+        ThreadFactory factory = new ThreadFactoryBuilder()
+                .setNameFormat("s3p-thread %d")
+                .setThreadFactory(Executors.defaultThreadFactory())
+                .build();
+        ExecutorService executorService = DynamicExecutors.newScalingThreadPool(1, 20, 60 * 1000, factory);
+
+        ConfigProperties properties = new ConfigProperties();
+        for (PropertySource<?> propertySource : ((AbstractEnvironment) env).getPropertySources()) {
+            if (propertySource instanceof MapPropertySource) {
+                properties.putAll(((MapPropertySource) propertySource).getSource());
+            }
+        }
+
+        BlobStore blobStore = createBlobStore(properties, executorService);
+        blobStore = parseMiddlewareProperties(blobStore, executorService, properties);
+
+        S3ProxyHandler handler = new S3ProxyHandler(blobStore,
                 builder.authenticationType, builder.identity,
                 builder.credential, builder.virtualHost,
                 builder.v4MaxNonChunkedRequestSize,
                 builder.ignoreUnknownHeaders, builder.corsRules,
                 builder.servicePath, builder.maximumTimeSkew);
+
+        String s3ProxyAuthorizationString = env.getProperty(S3ProxyConstants.PROPERTY_AUTHORIZATION);
+        if (AuthenticationType.fromString(s3ProxyAuthorizationString) != AuthenticationType.NONE) {
+            ImmutableMap.Builder<String, Map.Entry<String, BlobStore>> locators = ImmutableMap.builder();
+
+            String localIdentity = properties.getProperty(
+                    S3ProxyConstants.PROPERTY_IDENTITY);
+            String localCredential = properties.getProperty(
+                    S3ProxyConstants.PROPERTY_CREDENTIAL);
+            locators.put(localIdentity, Maps.immutableEntry(
+                    localCredential, blobStore));
+            final Map<String, Map.Entry<String, BlobStore>> locator = locators.build();
+            if (!locator.isEmpty()) {
+                handler.setBlobStoreLocator(new BlobStoreLocator() {
+                    @Override
+                    public Map.Entry<String, BlobStore> locateBlobStore(
+                            String identity, String container, String blob) {
+                        if (identity == null) {
+                            if (locator.size() == 1) {
+                                return locator.entrySet().iterator().next().getValue();
+                            }
+                            throw new IllegalArgumentException(
+                                    "cannot use anonymous access with multiple" +
+                                            " backends");
+                        }
+                        return locator.get(identity);
+                    }
+                });
+            }
+        }
+
+        ServletRegistrationBean registrationBean = new ServletRegistrationBean();
         registrationBean.setServlet(new S3ProxyServlet(handler));
         registrationBean.addUrlMappings(builder.servicePath != null ? builder.servicePath + "/*" : "/s3proxy/*");
         return registrationBean;
@@ -283,12 +360,133 @@ public class S3ProxyConfig {
             return credential;
         }
 
-
         private <T> T requireNonNull(T object) {
             if (object == null) {
                 throw new IllegalArgumentException("object require");
             }
             return object;
         }
+    }
+
+    /**
+     * 支持spring OriginTrackedValue
+     */
+    private static final class ConfigProperties extends Properties {
+        public String getProperty(String key) {
+            Object oval = super.get(key);
+            /**spring OriginTrackedValue 支持**/
+            if (oval instanceof OriginTrackedValue) {
+                oval = ((OriginTrackedValue) oval).getValue();
+            }
+            String sval = (oval instanceof String) ? (String) oval : null;
+            return ((sval == null) && (defaults != null)) ? defaults.getProperty(key) : sval;
+        }
+    }
+
+    private static BlobStore createBlobStore(Properties properties, ExecutorService executorService) throws IOException {
+        String provider = properties.getProperty(Constants.PROPERTY_PROVIDER);
+        String identity = properties.getProperty(Constants.PROPERTY_IDENTITY);
+        String credential = properties.getProperty(Constants.PROPERTY_CREDENTIAL);
+        String endpoint = properties.getProperty(Constants.PROPERTY_ENDPOINT);
+        properties.remove(Constants.PROPERTY_ENDPOINT);
+        String region = properties.getProperty(LocationConstants.PROPERTY_REGION);
+
+        if (provider == null) {
+            System.err.println(
+                    "Properties file must contain: " +
+                            Constants.PROPERTY_PROVIDER);
+            System.exit(1);
+        }
+
+        if (provider.equals("filesystem") || provider.equals("transient")) {
+            // local blobstores do not require credentials
+            identity = Strings.nullToEmpty(identity);
+            credential = Strings.nullToEmpty(credential);
+        } else if (provider.equals("google-cloud-storage")) {
+            File credentialFile = new File(credential);
+            if (credentialFile.exists()) {
+                credential = Files.asCharSource(credentialFile,
+                        StandardCharsets.UTF_8).read();
+            }
+            properties.remove(Constants.PROPERTY_CREDENTIAL);
+        }
+
+        if (identity == null || credential == null) {
+            System.err.println(
+                    "Properties file must contain: " +
+                            Constants.PROPERTY_IDENTITY + " and " +
+                            Constants.PROPERTY_CREDENTIAL);
+            System.exit(1);
+        }
+
+        properties.setProperty(Constants.PROPERTY_USER_AGENT,
+                String.format("s3proxy/%s jclouds/%s java/%s",
+                        S3ProxyServlet.class.getPackage().getImplementationVersion(),
+                        JcloudsVersion.get(),
+                        System.getProperty("java.version")));
+
+        ContextBuilder builder = ContextBuilder
+                .newBuilder(provider)
+                .credentials(identity, credential)
+                .modules(ImmutableList.<Module>of(
+                        new SLF4JLoggingModule(),
+                        new ExecutorServiceModule(executorService)))
+                .overrides(properties);
+        if (!Strings.isNullOrEmpty(endpoint)) {
+            builder = builder.endpoint(endpoint);
+        }
+
+        BlobStoreContext context = builder.build(BlobStoreContext.class);
+        BlobStore blobStore;
+        if (context instanceof RegionScopedBlobStoreContext && region != null) {
+            blobStore = ((RegionScopedBlobStoreContext) context).getBlobStore(region);
+        } else {
+            blobStore = context.getBlobStore();
+        }
+        return blobStore;
+    }
+
+    private static BlobStore parseMiddlewareProperties(BlobStore blobStore,
+                                                       ExecutorService executorService, Properties properties)
+            throws IOException {
+        Properties altProperties = new Properties();
+        for (Map.Entry<Object, Object> entry : properties.entrySet()) {
+            String key = (String) entry.getKey();
+            if (key.startsWith(S3ProxyConstants.PROPERTY_ALT_JCLOUDS_PREFIX)) {
+                key = key.substring(
+                        S3ProxyConstants.PROPERTY_ALT_JCLOUDS_PREFIX.length());
+                altProperties.put(key, (String) entry.getValue());
+            }
+        }
+
+        String eventualConsistency = properties.getProperty(S3ProxyConstants.PROPERTY_EVENTUAL_CONSISTENCY);
+        if ("true".equalsIgnoreCase(eventualConsistency)) {
+            BlobStore altBlobStore = createBlobStore(altProperties, executorService);
+            int delay = Integer.parseInt(properties.getProperty(
+                    S3ProxyConstants.PROPERTY_EVENTUAL_CONSISTENCY_DELAY, "5"));
+            double probability = Double.parseDouble(properties.getProperty(
+                    S3ProxyConstants.PROPERTY_EVENTUAL_CONSISTENCY_PROBABILITY, "1.0"));
+            System.err.println("Emulating eventual consistency with delay " +
+                    delay + " seconds and probability " + (probability * 100) +
+                    "%");
+            blobStore = EventualBlobStore.newEventualBlobStore(
+                    blobStore, altBlobStore,
+                    Executors.newScheduledThreadPool(1),
+                    delay, TimeUnit.SECONDS, probability);
+        }
+
+        String nullBlobStore = properties.getProperty(S3ProxyConstants.PROPERTY_NULL_BLOBSTORE);
+        if ("true".equalsIgnoreCase(nullBlobStore)) {
+            System.err.println("Using null storage backend");
+            blobStore = NullBlobStore.newNullBlobStore(blobStore);
+        }
+
+        String readOnlyBlobStore = properties.getProperty(S3ProxyConstants.PROPERTY_READ_ONLY_BLOBSTORE);
+        if ("true".equalsIgnoreCase(readOnlyBlobStore)) {
+            System.err.println("Using read-only storage backend");
+            blobStore = ReadOnlyBlobStore.newReadOnlyBlobStore(blobStore);
+        }
+
+        return blobStore;
     }
 }
