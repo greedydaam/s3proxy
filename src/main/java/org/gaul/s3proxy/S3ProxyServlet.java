@@ -25,9 +25,9 @@ import org.jclouds.rest.AuthorizationException;
 import org.jclouds.util.Throwables2;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Controller;
 
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import java.io.IOException;
@@ -35,15 +35,17 @@ import java.io.InputStream;
 import java.util.concurrent.TimeoutException;
 
 /**
- * Jetty-specific handler for S3 requests.
+ * tomcat-specific servlet for S3 requests.
  */
-@Controller
-public class S3ProxyController {
+public class S3ProxyServlet extends HttpServlet {
     private static final Logger logger = LoggerFactory.getLogger(
-            S3ProxyController.class);
+            S3ProxyServlet.class);
 
-    @Autowired
     private S3ProxyHandler handler;
+
+    S3ProxyServlet(S3ProxyHandler handler) {
+        this.handler = handler;
+    }
 
     private void sendS3Exception(HttpServletRequest request,
                                  HttpServletResponse response, S3Exception se)
@@ -52,11 +54,9 @@ public class S3ProxyController {
                 se.getError(), se.getMessage(), se.getElements());
     }
 
-    public void handle(
-            HttpServletRequest request, HttpServletResponse response)
-            throws IOException {
+    @Override
+    public void service(HttpServletRequest request, HttpServletResponse response) throws ServletException, IOException {
         try (InputStream is = request.getInputStream()) {
-
             // Set query encoding
             request.setAttribute(S3ProxyConstants.ATTRIBUTE_QUERY_ENCODING,
                     request.getCharacterEncoding());
@@ -65,7 +65,6 @@ public class S3ProxyController {
         } catch (ContainerNotFoundException cnfe) {
             S3ErrorCode code = S3ErrorCode.NO_SUCH_BUCKET;
             handler.sendSimpleErrorResponse(request, response, code, code.getMessage(), ImmutableMap.<String, String>of());
-            return;
         } catch (HttpResponseException hre) {
             HttpResponse hr = hre.getResponse();
             if (hr == null) {
@@ -125,7 +124,4 @@ public class S3ProxyController {
         }
     }
 
-    public S3ProxyHandler getHandler() {
-        return this.handler;
-    }
 }

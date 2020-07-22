@@ -20,8 +20,10 @@ import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import org.jclouds.blobstore.BlobStore;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
+import org.springframework.boot.web.servlet.ServletRegistrationBean;
 import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
 
 import java.net.URI;
@@ -30,22 +32,27 @@ import java.net.URISyntaxException;
 /**
  * Jetty-specific handler for S3 requests.
  */
-@Configuration
+@ConditionalOnWebApplication
+@ConditionalOnProperty(name = "s3proxy.servlet.enabled", havingValue = "true", matchIfMissing = true)
 public class S3ProxyConfig {
 
     @Bean
-    public S3ProxyHandler s3ProxyHandler(Environment properties) throws URISyntaxException {
+    public ServletRegistrationBean s3ProxyHandler(Environment properties) throws URISyntaxException {
+        ServletRegistrationBean registrationBean = new ServletRegistrationBean();
         Builder builder = Builder.fromProperties(properties);
+
         S3ProxyHandler handler = new S3ProxyHandler(builder.blobStore,
                 builder.authenticationType, builder.identity,
                 builder.credential, builder.virtualHost,
                 builder.v4MaxNonChunkedRequestSize,
                 builder.ignoreUnknownHeaders, builder.corsRules,
                 builder.servicePath, builder.maximumTimeSkew);
-        return handler;
+        registrationBean.setServlet(new S3ProxyServlet(handler));
+        registrationBean.addUrlMappings(builder.servicePath != null ? builder.servicePath + "/*" : "/s3proxy/*");
+        return registrationBean;
     }
 
-    public static final class Builder {
+    private static final class Builder {
         private BlobStore blobStore;
         private URI endpoint;
         private URI secureEndpoint;
@@ -70,10 +77,8 @@ public class S3ProxyConfig {
                 throws URISyntaxException {
             Builder builder = new Builder();
 
-            String endpoint = properties.getProperty(
-                    S3ProxyConstants.PROPERTY_ENDPOINT);
-            String secureEndpoint = properties.getProperty(
-                    S3ProxyConstants.PROPERTY_SECURE_ENDPOINT);
+            String endpoint = properties.getProperty(S3ProxyConstants.PROPERTY_ENDPOINT);
+            String secureEndpoint = properties.getProperty(S3ProxyConstants.PROPERTY_SECURE_ENDPOINT);
             if (endpoint == null && secureEndpoint == null) {
                 throw new IllegalArgumentException(
                         "Properties file must contain: " +
@@ -86,26 +91,22 @@ public class S3ProxyConfig {
             if (secureEndpoint != null) {
                 builder.secureEndpoint(new URI(secureEndpoint));
             }
-            String authorizationString = properties.getProperty(
-                    S3ProxyConstants.PROPERTY_AUTHORIZATION);
+            String authorizationString = properties.getProperty(S3ProxyConstants.PROPERTY_AUTHORIZATION);
             if (authorizationString == null) {
                 throw new IllegalArgumentException(
                         "Properties file must contain: " +
                                 S3ProxyConstants.PROPERTY_AUTHORIZATION);
             }
 
-            AuthenticationType authorization =
-                    AuthenticationType.fromString(authorizationString);
+            AuthenticationType authorization = AuthenticationType.fromString(authorizationString);
             String localIdentity = null;
             String localCredential = null;
             switch (authorization) {
                 case AWS_V2:
                 case AWS_V4:
                 case AWS_V2_OR_V4:
-                    localIdentity = properties.getProperty(
-                            S3ProxyConstants.PROPERTY_IDENTITY);
-                    localCredential = properties.getProperty(
-                            S3ProxyConstants.PROPERTY_CREDENTIAL);
+                    localIdentity = properties.getProperty(S3ProxyConstants.PROPERTY_IDENTITY);
+                    localCredential = properties.getProperty(S3ProxyConstants.PROPERTY_CREDENTIAL);
                     if (localIdentity == null || localCredential == null) {
                         throw new IllegalArgumentException("Must specify both " +
                                 S3ProxyConstants.PROPERTY_IDENTITY + " and " +
@@ -116,62 +117,50 @@ public class S3ProxyConfig {
                 case NONE:
                     break;
                 default:
-                    throw new IllegalArgumentException(
-                            S3ProxyConstants.PROPERTY_AUTHORIZATION +
-                                    " invalid value, was: " + authorization);
+                    throw new IllegalArgumentException(S3ProxyConstants.PROPERTY_AUTHORIZATION +
+                            " invalid value, was: " + authorization);
             }
 
             if (localIdentity != null || localCredential != null) {
-                builder.awsAuthentication(authorization, localIdentity,
-                        localCredential);
+                builder.awsAuthentication(authorization, localIdentity, localCredential);
             }
 
-            String servicePath = Strings.nullToEmpty(properties.getProperty(
-                    S3ProxyConstants.PROPERTY_SERVICE_PATH));
+            String servicePath = Strings.nullToEmpty(properties.getProperty(S3ProxyConstants.PROPERTY_SERVICE_PATH));
             if (servicePath != null) {
                 builder.servicePath(servicePath);
             }
 
-            String keyStorePath = properties.getProperty(
-                    S3ProxyConstants.PROPERTY_KEYSTORE_PATH);
-            String keyStorePassword = properties.getProperty(
-                    S3ProxyConstants.PROPERTY_KEYSTORE_PASSWORD);
+            String keyStorePath = properties.getProperty(S3ProxyConstants.PROPERTY_KEYSTORE_PATH);
+            String keyStorePassword = properties.getProperty(S3ProxyConstants.PROPERTY_KEYSTORE_PASSWORD);
             if (keyStorePath != null || keyStorePassword != null) {
                 builder.keyStore(keyStorePath, keyStorePassword);
             }
 
-            String virtualHost = properties.getProperty(
-                    S3ProxyConstants.PROPERTY_VIRTUAL_HOST);
+            String virtualHost = properties.getProperty(S3ProxyConstants.PROPERTY_VIRTUAL_HOST);
             if (!Strings.isNullOrEmpty(virtualHost)) {
                 builder.virtualHost(virtualHost);
             }
 
-            String v4MaxNonChunkedRequestSize = properties.getProperty(
-                    S3ProxyConstants.PROPERTY_V4_MAX_NON_CHUNKED_REQUEST_SIZE);
+            String v4MaxNonChunkedRequestSize = properties.getProperty(S3ProxyConstants.PROPERTY_V4_MAX_NON_CHUNKED_REQUEST_SIZE);
             if (v4MaxNonChunkedRequestSize != null) {
                 builder.v4MaxNonChunkedRequestSize(Long.parseLong(
                         v4MaxNonChunkedRequestSize));
             }
 
-            String ignoreUnknownHeaders = properties.getProperty(
-                    S3ProxyConstants.PROPERTY_IGNORE_UNKNOWN_HEADERS);
+            String ignoreUnknownHeaders = properties.getProperty(S3ProxyConstants.PROPERTY_IGNORE_UNKNOWN_HEADERS);
             if (!Strings.isNullOrEmpty(ignoreUnknownHeaders)) {
                 builder.ignoreUnknownHeaders(Boolean.parseBoolean(
                         ignoreUnknownHeaders));
             }
 
-            String corsAllowAll = properties.getProperty(
-                    S3ProxyConstants.PROPERTY_CORS_ALLOW_ALL);
+            String corsAllowAll = properties.getProperty(S3ProxyConstants.PROPERTY_CORS_ALLOW_ALL);
             if (!Strings.isNullOrEmpty(corsAllowAll) && Boolean.parseBoolean(
                     corsAllowAll)) {
                 builder.corsRules(new CrossOriginResourceSharing());
             } else {
-                String corsAllowOrigins = properties.getProperty(
-                        S3ProxyConstants.PROPERTY_CORS_ALLOW_ORIGINS, "");
-                String corsAllowMethods = properties.getProperty(
-                        S3ProxyConstants.PROPERTY_CORS_ALLOW_METHODS, "");
-                String corsAllowHeaders = properties.getProperty(
-                        S3ProxyConstants.PROPERTY_CORS_ALLOW_HEADERS, "");
+                String corsAllowOrigins = properties.getProperty(S3ProxyConstants.PROPERTY_CORS_ALLOW_ORIGINS, "");
+                String corsAllowMethods = properties.getProperty(S3ProxyConstants.PROPERTY_CORS_ALLOW_METHODS, "");
+                String corsAllowHeaders = properties.getProperty(S3ProxyConstants.PROPERTY_CORS_ALLOW_HEADERS, "");
                 Splitter splitter = Splitter.on(" ").trimResults()
                         .omitEmptyStrings();
 
@@ -181,14 +170,12 @@ public class S3ProxyConfig {
                         Lists.newArrayList(splitter.split(corsAllowHeaders))));
             }
 
-            String jettyMaxThreads = properties.getProperty(
-                    S3ProxyConstants.PROPERTY_JETTY_MAX_THREADS);
+            String jettyMaxThreads = properties.getProperty(S3ProxyConstants.PROPERTY_JETTY_MAX_THREADS);
             if (jettyMaxThreads != null) {
                 builder.jettyMaxThreads(Integer.parseInt(jettyMaxThreads));
             }
 
-            String maximumTimeSkew = properties.getProperty(
-                    S3ProxyConstants.PROPERTY_MAXIMUM_TIME_SKEW);
+            String maximumTimeSkew = properties.getProperty(S3ProxyConstants.PROPERTY_MAXIMUM_TIME_SKEW);
             if (maximumTimeSkew != null) {
                 builder.maximumTimeSkew(Integer.parseInt(maximumTimeSkew));
             }
