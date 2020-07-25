@@ -59,7 +59,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Jetty-specific handler for S3 requests.
+ *  S3ProxyConfig modify by adam
  */
 @Configuration
 @ConditionalOnWebApplication
